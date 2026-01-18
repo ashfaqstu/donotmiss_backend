@@ -25,6 +25,39 @@ def health_check():
     return jsonify({"status": "ok", "timestamp": _now_iso()})
 
 
+@bp.get("/db-status")
+def db_status():
+    """Check database connection status."""
+    from flask import current_app
+    from sqlalchemy import text
+    
+    db_url = current_app.config.get("SQLALCHEMY_DATABASE_URI", "")
+    is_postgres = "postgresql" in db_url
+    
+    try:
+        # Test actual database connection
+        result = db.session.execute(text("SELECT 1"))
+        result.fetchone()
+        db_connected = True
+        
+        # Get task count as additional verification
+        task_count = Task.query.count()
+        
+        return jsonify({
+            "status": "connected",
+            "database_type": "PostgreSQL" if is_postgres else "SQLite",
+            "task_count": task_count,
+            "timestamp": _now_iso()
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "database_type": "PostgreSQL" if is_postgres else "SQLite",
+            "error": str(e),
+            "timestamp": _now_iso()
+        }), 500
+
+
 # ============================================================
 # Task CRUD Operations
 # ============================================================
@@ -63,7 +96,7 @@ def create_task():
         'text': text,
         'source': data.get('source', 'web'),
         'url': data.get('url'),
-        'priority': data.get('priority', 'medium'),
+        'priority': data.get(   'priority', 'medium'),
         'deadline': data.get('deadline'),
         'status': 'pending',
         'createdVia': 'extension',
