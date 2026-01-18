@@ -1,6 +1,8 @@
 import os
+import json
 from uuid import uuid4
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from flask import Blueprint, jsonify, request, abort
@@ -8,8 +10,35 @@ from flask import Blueprint, jsonify, request, abort
 
 bp = Blueprint("donotmiss_api", __name__)
 
-# In-memory task store for now. In real usage, replace with DB.
-_TASKS = {}
+# File-based persistent storage (works on Render free tier)
+# For production, consider using a proper database
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/donotmiss"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+TASKS_FILE = DATA_DIR / "tasks.json"
+
+
+def _load_tasks():
+    """Load tasks from persistent storage."""
+    if TASKS_FILE.exists():
+        try:
+            with open(TASKS_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
+    return {}
+
+
+def _save_tasks(tasks):
+    """Save tasks to persistent storage."""
+    try:
+        with open(TASKS_FILE, "w") as f:
+            json.dump(tasks, f, indent=2)
+    except IOError as e:
+        print(f"Warning: Could not save tasks: {e}")
+
+
+# Load tasks on startup
+_TASKS = _load_tasks()
 
 # Jira configuration from environment variables
 JIRA_SITE = os.environ.get("JIRA_SITE")  # e.g., "ahammadshawki8.atlassian.net"
@@ -140,13 +169,15 @@ def create_task():
         "source": data.get("source") or "web",
         "url": data.get("url"),
         "priority": data.get("priority") or "medium",
+        "deadline": data.get("deadline"),
         "status": data.get("status") or "pending",
         "createdAt": data.get("createdAt") or _now_iso(),
-        "createdVia": "donotmiss-flask",
+        "createdVia": data.get("metadata", {}).get("capturedVia", "donotmiss-extension"),
         "metadata": data.get("metadata") or {},
     }
 
     _TASKS[task_id] = task
+    _save_tasks(_TASKS)  # Persist to storage
     return jsonify(task), 201
 
 
@@ -165,6 +196,7 @@ def send_task(task_id: str):
         task["sentAt"] = _now_iso()
         task["jiraKey"] = jira_key
         task["jiraUrl"] = f"https://{JIRA_SITE}/browse/{jira_key}"
+        _save_tasks(_TASKS)  # Persist to storage
         return jsonify(task)
     else:
         return jsonify({"error": error or "Failed to create Jira issue"}), 500
@@ -174,6 +206,26 @@ def send_task(task_id: str):
 def send_task_to_jira(task_id: str):
     """Alternative endpoint - send existing task to Jira."""
     return send_task(task_id)
+
+
+@bp.post("/tasks/<task_id>/mark-sent")
+def mark_task_sent(task_id: str):
+    """Mark a task as sent (called by Forge app after creating Jira issue)."""
+    task = _TASKS.get(task_id)
+    if not task:
+        abort(404, description="Task not found")
+    
+    data = request.get_json(silent=True) or {}
+    
+    task["status"] = "sent"
+    task["sentAt"] = _now_iso()
+    if data.get("jiraKey"):
+        task["jiraKey"] = data["jiraKey"]
+    if data.get("jiraUrl"):
+        task["jiraUrl"] = data["jiraUrl"]
+    
+    _save_tasks(_TASKS)  # Persist to storage
+    return jsonify(task)
 
 
 @bp.post("/tasks/create-and-send")
@@ -211,12 +263,14 @@ def create_and_send_task():
         task["jiraKey"] = jira_key
         task["jiraUrl"] = f"https://{JIRA_SITE}/browse/{jira_key}"
         _TASKS[task_id] = task
+        _save_tasks(_TASKS)  # Persist to storage
         return jsonify(task), 201
     else:
         # Store task anyway but mark as failed
         task["status"] = "failed"
         task["error"] = error
         _TASKS[task_id] = task
+        _save_tasks(_TASKS)  # Persist to storage
         return jsonify({"error": error or "Failed to create Jira issue", "task": task}), 500
 
 
@@ -237,4 +291,5 @@ def delete_task(task_id: str):
     task = _TASKS.pop(task_id, None)
     if not task:
         abort(404, description="Task not found")
+    _save_tasks(_TASKS)  # Persist to storage
     return "", 204
