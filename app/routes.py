@@ -14,6 +14,12 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+@bp.get("/health")
+def health_check():
+    """Health check endpoint to verify backend is awake."""
+    return jsonify({"status": "ok", "timestamp": _now_iso()})
+
+
 @bp.get("/tasks")
 def list_tasks():
     """Return all tasks.
