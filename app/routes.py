@@ -1,135 +1,23 @@
-import os
+"""API routes for DoNotMiss backend."""
 import json
 from uuid import uuid4
 from datetime import datetime, timezone
-from pathlib import Path
 
-import requests
 from flask import Blueprint, jsonify, request, abort
+
+from .models import db, Task
 
 
 bp = Blueprint("donotmiss_api", __name__)
-
-# File-based persistent storage (works on Render free tier)
-# For production, consider using a proper database
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/donotmiss"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-TASKS_FILE = DATA_DIR / "tasks.json"
-
-
-def _load_tasks():
-    """Load tasks from persistent storage."""
-    if TASKS_FILE.exists():
-        try:
-            with open(TASKS_FILE, "r") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            return {}
-    return {}
-
-
-def _save_tasks(tasks):
-    """Save tasks to persistent storage."""
-    try:
-        with open(TASKS_FILE, "w") as f:
-            json.dump(tasks, f, indent=2)
-    except IOError as e:
-        print(f"Warning: Could not save tasks: {e}")
-
-
-# Load tasks on startup
-_TASKS = _load_tasks()
-
-# Jira configuration from environment variables
-JIRA_SITE = os.environ.get("JIRA_SITE")  # e.g., "ahammadshawki8.atlassian.net"
-JIRA_EMAIL = os.environ.get("JIRA_EMAIL")  # Your Atlassian account email
-JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN")  # API token from id.atlassian.com
-JIRA_PROJECT_KEY = os.environ.get("JIRA_PROJECT_KEY", "DNM")  # Default project key
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _get_jira_auth():
-    """Return auth tuple for Jira API requests."""
-    if not JIRA_EMAIL or not JIRA_API_TOKEN:
-        return None
-    return (JIRA_EMAIL, JIRA_API_TOKEN)
-
-
-def _create_jira_issue(task):
-    """Create a Jira issue from a task. Returns issue key or None."""
-    if not JIRA_SITE or not _get_jira_auth():
-        return None, "Jira credentials not configured"
-    
-    # Map priority
-    priority_map = {
-        "highest": "1",
-        "high": "2", 
-        "medium": "3",
-        "low": "4",
-        "lowest": "5"
-    }
-    
-    # Build issue payload
-    issue_data = {
-        "fields": {
-            "project": {"key": JIRA_PROJECT_KEY},
-            "summary": task.get("title", task.get("text", "")[:80]),
-            "description": {
-                "type": "doc",
-                "version": 1,
-                "content": [
-                    {
-                        "type": "paragraph",
-                        "content": [{"type": "text", "text": task.get("description") or task.get("text", "")}]
-                    },
-                    {
-                        "type": "paragraph", 
-                        "content": [
-                            {"type": "text", "text": f"📍 Source: {task.get('source', 'web').upper()}"},
-                        ]
-                    },
-                    {
-                        "type": "paragraph",
-                        "content": [
-                            {"type": "text", "text": f"🔗 URL: {task.get('url', 'N/A')}"}
-                        ]
-                    },
-                    {
-                        "type": "paragraph",
-                        "content": [{"type": "text", "text": "✨ Created via DoNotMiss"}]
-                    }
-                ]
-            },
-            "issuetype": {"name": "Task"},
-            "priority": {"id": priority_map.get(task.get("priority", "medium"), "3")},
-            "labels": ["donotmiss", f"source-{task.get('source', 'web')}"]
-        }
-    }
-    
-    # Add due date if deadline exists
-    if task.get("deadline"):
-        issue_data["fields"]["duedate"] = task["deadline"]
-    
-    try:
-        response = requests.post(
-            f"https://{JIRA_SITE}/rest/api/3/issue",
-            json=issue_data,
-            auth=_get_jira_auth(),
-            headers={"Content-Type": "application/json"}
-        )
-        
-        if response.ok:
-            result = response.json()
-            return result.get("key"), None
-        else:
-            error_msg = response.json().get("errorMessages", [response.text])
-            return None, str(error_msg)
-    except Exception as e:
-        return None, str(e)
-
+# ============================================================
+# Health & Status
+# ============================================================
 
 @bp.get("/health")
 def health_check():
@@ -137,159 +25,181 @@ def health_check():
     return jsonify({"status": "ok", "timestamp": _now_iso()})
 
 
+# ============================================================
+# Task CRUD Operations
+# ============================================================
+
 @bp.get("/tasks")
 def list_tasks():
     """Return all tasks.
-
+    
     Optional query param `status` can filter tasks by status
-    (e.g., pending, sent, deleted).
+    (e.g., pending, sent, declined).
     """
     status = request.args.get("status")
-    tasks = list(_TASKS.values())
+    
+    query = Task.query.order_by(Task.created_at.desc())
     if status:
-        tasks = [t for t in tasks if t.get("status") == status]
-    return jsonify(tasks)
+        query = query.filter(Task.status == status)
+    
+    tasks = query.all()
+    return jsonify([task.to_dict() for task in tasks])
 
 
 @bp.post("/tasks")
 def create_task():
-    data = request.get_json(silent=True) or {}
-
-    text = data.get("text")
-    if not text:
-        abort(400, description="Missing required field: text")
-
-    task_id = data.get("id") or f"task-{uuid4()}"
-
-    task = {
-        "id": task_id,
-        "title": data.get("title") or text[:80],
-        "description": data.get("description") or text,
-        "text": text,
-        "source": data.get("source") or "web",
-        "url": data.get("url"),
-        "priority": data.get("priority") or "medium",
-        "deadline": data.get("deadline"),
-        "status": data.get("status") or "pending",
-        "createdAt": data.get("createdAt") or _now_iso(),
-        "createdVia": data.get("metadata", {}).get("capturedVia", "donotmiss-extension"),
-        "metadata": data.get("metadata") or {},
-    }
-
-    _TASKS[task_id] = task
-    _save_tasks(_TASKS)  # Persist to storage
-    return jsonify(task), 201
-
-
-@bp.post("/tasks/<task_id>/send")
-def send_task(task_id: str):
-    """Send a task to Jira by creating an issue."""
-    task = _TASKS.get(task_id)
-    if not task:
-        abort(404, description="Task not found")
-
-    # Create Jira issue
-    jira_key, error = _create_jira_issue(task)
-    
-    if jira_key:
-        task["status"] = "sent"
-        task["sentAt"] = _now_iso()
-        task["jiraKey"] = jira_key
-        task["jiraUrl"] = f"https://{JIRA_SITE}/browse/{jira_key}"
-        _save_tasks(_TASKS)  # Persist to storage
-        return jsonify(task)
-    else:
-        return jsonify({"error": error or "Failed to create Jira issue"}), 500
-
-
-@bp.post("/tasks/<task_id>/send-to-jira")
-def send_task_to_jira(task_id: str):
-    """Alternative endpoint - send existing task to Jira."""
-    return send_task(task_id)
-
-
-@bp.post("/tasks/<task_id>/mark-sent")
-def mark_task_sent(task_id: str):
-    """Mark a task as sent (called by Forge app after creating Jira issue)."""
-    task = _TASKS.get(task_id)
-    if not task:
-        abort(404, description="Task not found")
-    
-    data = request.get_json(silent=True) or {}
-    
-    task["status"] = "sent"
-    task["sentAt"] = _now_iso()
-    if data.get("jiraKey"):
-        task["jiraKey"] = data["jiraKey"]
-    if data.get("jiraUrl"):
-        task["jiraUrl"] = data["jiraUrl"]
-    
-    _save_tasks(_TASKS)  # Persist to storage
-    return jsonify(task)
-
-
-@bp.post("/tasks/create-and-send")
-def create_and_send_task():
-    """Create a task and immediately send it to Jira."""
+    """Create a new task from extension capture."""
     data = request.get_json(silent=True) or {}
 
     text = data.get("text") or data.get("description")
     if not text:
         abort(400, description="Missing required field: text or description")
 
-    task_id = data.get("id") or f"task-{uuid4()}"
-
-    task = {
-        "id": task_id,
-        "title": data.get("title") or text[:80],
-        "description": data.get("description") or text,
-        "text": text,
-        "source": data.get("source") or "web",
-        "url": data.get("url"),
-        "priority": data.get("priority") or "medium",
-        "deadline": data.get("deadline"),
-        "status": "pending",
-        "createdAt": data.get("createdAt") or _now_iso(),
-        "createdVia": "donotmiss-extension",
-        "metadata": data.get("metadata") or {},
-    }
-
-    # Create Jira issue immediately
-    jira_key, error = _create_jira_issue(task)
-    
-    if jira_key:
-        task["status"] = "sent"
-        task["sentAt"] = _now_iso()
-        task["jiraKey"] = jira_key
-        task["jiraUrl"] = f"https://{JIRA_SITE}/browse/{jira_key}"
-        _TASKS[task_id] = task
-        _save_tasks(_TASKS)  # Persist to storage
-        return jsonify(task), 201
-    else:
-        # Store task anyway but mark as failed
-        task["status"] = "failed"
-        task["error"] = error
-        _TASKS[task_id] = task
-        _save_tasks(_TASKS)  # Persist to storage
-        return jsonify({"error": error or "Failed to create Jira issue", "task": task}), 500
-
-
-@bp.get("/jira/status")
-def jira_status():
-    """Check if Jira integration is configured."""
-    configured = bool(JIRA_SITE and JIRA_EMAIL and JIRA_API_TOKEN)
-    return jsonify({
-        "configured": configured,
-        "site": JIRA_SITE if configured else None,
-        "project": JIRA_PROJECT_KEY if configured else None
+    # Create task from data
+    task = Task.from_dict({
+        'id': data.get('id') or f"task-{uuid4()}",
+        'title': data.get('title') or text[:80],
+        'description': data.get('description') or text,
+        'text': text,
+        'source': data.get('source', 'web'),
+        'url': data.get('url'),
+        'priority': data.get('priority', 'medium'),
+        'deadline': data.get('deadline'),
+        'status': 'pending',
+        'createdVia': 'extension',
+        'metadata': data.get('metadata', {})
     })
+    
+    db.session.add(task)
+    db.session.commit()
+    
+    return jsonify(task.to_dict()), 201
+
+
+@bp.get("/tasks/<task_id>")
+def get_task(task_id: str):
+    """Get a single task by ID."""
+    task = Task.query.get(task_id)
+    if not task:
+        abort(404, description="Task not found")
+    return jsonify(task.to_dict())
+
+
+@bp.put("/tasks/<task_id>")
+def update_task(task_id: str):
+    """Update a task."""
+    task = Task.query.get(task_id)
+    if not task:
+        abort(404, description="Task not found")
+    
+    data = request.get_json(silent=True) or {}
+    
+    if 'title' in data:
+        task.title = data['title']
+    if 'description' in data:
+        task.description = data['description']
+    if 'priority' in data:
+        task.priority = data['priority']
+    if 'deadline' in data:
+        if data['deadline']:
+            from datetime import date
+            task.deadline = date.fromisoformat(data['deadline'].split('T')[0])
+        else:
+            task.deadline = None
+    if 'status' in data:
+        task.status = data['status']
+    
+    db.session.commit()
+    return jsonify(task.to_dict())
 
 
 @bp.delete("/tasks/<task_id>")
 def delete_task(task_id: str):
-    """Delete a task from the store."""
-    task = _TASKS.pop(task_id, None)
+    """Delete a task permanently."""
+    task = Task.query.get(task_id)
     if not task:
         abort(404, description="Task not found")
-    _save_tasks(_TASKS)  # Persist to storage
+    
+    db.session.delete(task)
+    db.session.commit()
     return "", 204
+
+
+# ============================================================
+# Task Status Operations (for Forge app)
+# ============================================================
+
+@bp.post("/tasks/<task_id>/mark-sent")
+def mark_task_sent(task_id: str):
+    """Mark a task as sent (called by Forge app after creating Jira issue)."""
+    task = Task.query.get(task_id)
+    if not task:
+        abort(404, description="Task not found")
+    
+    data = request.get_json(silent=True) or {}
+    
+    task.status = "sent"
+    task.sent_at = datetime.now(timezone.utc)
+    if data.get("jiraKey"):
+        task.jira_key = data["jiraKey"]
+    if data.get("jiraUrl"):
+        task.jira_url = data["jiraUrl"]
+    
+    db.session.commit()
+    return jsonify(task.to_dict())
+
+
+@bp.post("/tasks/<task_id>/decline")
+def decline_task(task_id: str):
+    """Mark a task as declined."""
+    task = Task.query.get(task_id)
+    if not task:
+        abort(404, description="Task not found")
+    
+    task.status = "declined"
+    task.declined_at = datetime.now(timezone.utc)
+    
+    db.session.commit()
+    return jsonify(task.to_dict())
+
+
+@bp.post("/tasks/<task_id>/restore")
+def restore_task(task_id: str):
+    """Restore a declined task back to pending."""
+    task = Task.query.get(task_id)
+    if not task:
+        abort(404, description="Task not found")
+    
+    task.status = "pending"
+    task.declined_at = None
+    
+    db.session.commit()
+    return jsonify(task.to_dict())
+
+
+# ============================================================
+# Bulk Operations
+# ============================================================
+
+@bp.delete("/tasks")
+def clear_all_tasks():
+    """Delete all tasks (use with caution)."""
+    Task.query.delete()
+    db.session.commit()
+    return jsonify({"success": True, "message": "All tasks deleted"})
+
+
+@bp.get("/stats")
+def get_stats():
+    """Get task statistics."""
+    pending_count = Task.query.filter(Task.status == 'pending').count()
+    sent_count = Task.query.filter(Task.status == 'sent').count()
+    declined_count = Task.query.filter(Task.status == 'declined').count()
+    total_count = Task.query.count()
+    
+    return jsonify({
+        "total": total_count,
+        "pending": pending_count,
+        "sent": sent_count,
+        "declined": declined_count
+    })
